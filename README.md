@@ -66,13 +66,13 @@ The service supports two methods for collecting Twitter data:
 The browser client requires Twitter session cookies for authentication.
 
 1. **Open browser DevTools**:
-   - Navigate to `https://twitter.com`
+   - Navigate to `https://x.com` while logged in
    - Press `F12` to open DevTools
-   - Go to **Application** → **Storage** → **Cookies**
+   - Go to **Application** → **Storage** → **Cookies** → `https://x.com`
    - Select all cookies (Ctrl+A / Cmd+A)
    - Copy (Ctrl+C / Cmd+C) - this copies in tab-separated format
 
-3. **Run the cookie creation script**:
+2. **Run the cookie creation script**:
    ```bash
    python scripts/create_cookies_json.py
    ```
@@ -80,7 +80,11 @@ The browser client requires Twitter session cookies for authentication.
    - Press `Enter` twice or `Ctrl+D` (Windows: `Ctrl+Z`) when done
    - This creates `cookies.json` in the project root
 
-**Note**: Cookies expire after ~30 days. You'll need to refresh them periodically.
+3. **Copy `cookies.json` into `TWITTER_SESSION_COOKIES`**:
+   - Locally: paste the JSON into `.env` as `TWITTER_SESSION_COOKIES=...` (no extra quotes around the array)
+   - GitHub Actions: paste the same JSON into the `TWITTER_SESSION_COOKIES` repository secret. Creating `cookies.json` alone does **not** update CI.
+
+**Note**: Session cookies can be revoked by X well before they expire, especially when GitHub Actions uses them from a new IP. Refresh them if authentication starts failing.
 
 ### Step 3: Create a `.env` file in the project root
 
@@ -92,9 +96,9 @@ You will fill in the values based on the keys you obtain in the steps to follow
 TWITTER_CLIENT_TYPE=browser
 
 # Browser Client Authentication (choose one method)
-# Option 1: Use cookies.json file (created above) - no env var needed
-# Option 2: Use environment variable
-TWITTER_SESSION_COOKIES='[{"name":"auth_token","value":"...","domain":".twitter.com",...}]'
+# Option 1: cookies.json in the project root (local runs)
+# Option 2: TWITTER_SESSION_COOKIES env var / GitHub secret (required for CI)
+TWITTER_SESSION_COOKIES=[{"name":"auth_token","value":"...","domain":".x.com",...}]
 
 # Used to construct profile/likes URLs in addition to auth if using with password
 TWITTER_USERNAME=your_twitter_username

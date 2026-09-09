@@ -1,9 +1,19 @@
 """Stealth measures to avoid bot detection"""
 
 import random
+import sys
 from typing import Optional
 
 from playwright.async_api import BrowserContext, Page
+from playwright_stealth import Stealth
+
+
+def _navigator_platform() -> str:
+    if sys.platform.startswith("linux"):
+        return "Linux x86_64"
+    if sys.platform == "darwin":
+        return "MacIntel"
+    return "Win32"
 
 
 async def apply_stealth_measures(context: BrowserContext) -> None:
@@ -13,35 +23,10 @@ async def apply_stealth_measures(context: BrowserContext) -> None:
     Args:
         context: Playwright browser context
     """
-    # Override webdriver property
-    await context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-
-        // Override plugins
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-
-        // Override languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en']
-        });
-
-        // Override permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
-
-        // Chrome runtime
-        window.chrome = {
-            runtime: {}
-        };
-    """)
+    await Stealth(
+        navigator_platform_override=_navigator_platform(),
+        navigator_languages_override=("en-US", "en"),
+    ).apply_stealth_async(context)
 
 
 async def human_like_scroll(page: Page, distance: Optional[int] = None) -> None:

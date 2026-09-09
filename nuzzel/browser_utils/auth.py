@@ -4,10 +4,87 @@ import asyncio
 import json
 import logging
 import random
+from typing import Any, Dict, List, Optional
 
 from playwright.async_api import BrowserContext, Page
 
 logger = logging.getLogger(__name__)
+
+_X_HOSTS = {"x.com", "twitter.com"}
+_SAMESITE_MAP = {
+    "lax": "Lax",
+    "strict": "Strict",
+    "none": "None",
+    "no_restriction": "None",
+}
+
+
+def _normalize_samesite(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    mapped = _SAMESITE_MAP.get(str(value).strip().lower())
+    return mapped
+
+
+def _domains_for_cookie(domain: str) -> List[str]:
+    """Return domains to set the cookie on.
+
+    Cookies copied from DevTools are often scoped to either .twitter.com or
+    .x.com. Playwright only sends a cookie to the host you navigate to, so a
+    .twitter.com auth_token is silently dropped on https://x.com/home.
+    """
+    host = domain.lower().lstrip(".")
+    if host in _X_HOSTS:
+        return [".x.com", ".twitter.com"]
+    return [domain]
+
+
+def prepare_cookies(cookies_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize browser cookies into Playwright SetCookieParam dicts.
+
+    Strips expiration (Twitter still accepts a valid auth_token) and mirrors
+    x.com/twitter.com cookies onto both domains.
+    """
+    cookies: List[Dict[str, Any]] = []
+    seen = set()
+    names = []
+
+    for cookie in cookies_data:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name or value is None:
+            continue
+
+        names.append(name)
+        cookie_domain = cookie.get("domain") or ".x.com"
+        same_site = _normalize_samesite(cookie.get("sameSite"))
+
+        for domain in _domains_for_cookie(cookie_domain):
+            key = (name, domain, cookie.get("path", "/"))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            cookie_obj: Dict[str, Any] = {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": cookie.get("path", "/"),
+            }
+            if cookie.get("secure") or same_site == "None":
+                cookie_obj["secure"] = True
+            if cookie.get("httpOnly"):
+                cookie_obj["httpOnly"] = True
+            if same_site:
+                cookie_obj["sameSite"] = same_site
+            cookies.append(cookie_obj)
+
+    if "auth_token" not in names:
+        logger.warning("No auth_token cookie found; authentication is likely to fail")
+    if "ct0" not in names:
+        logger.warning("No ct0 cookie found; X API requests may fail CSRF checks")
+
+    return cookies
 
 
 async def inject_cookies(context: BrowserContext, cookies_json: str) -> None:
@@ -23,33 +100,18 @@ async def inject_cookies(context: BrowserContext, cookies_json: str) -> None:
         if not isinstance(cookies_data, list):
             raise ValueError("Cookies must be a JSON array")
 
-        # Strip 'expires' field from cookies to ensure Playwright accepts them
-        # even if they appear expired (Twitter often accepts them as long as
-        # the auth_token is valid). This matches debug_twitter_ui.py behavior.
-        cookies = []
-        for cookie in cookies_data:
-            cookie_domain = cookie.get("domain")
-            if not cookie_domain:
-                cookie_domain = ".x.com"
-
-            cookie_obj = {
-                "name": cookie["name"],
-                "value": cookie["value"],
-                "domain": cookie_domain,
-                "path": cookie.get("path", "/"),
-            }
-            if cookie.get("secure"):
-                cookie_obj["secure"] = True
-            if cookie.get("httpOnly"):
-                cookie_obj["httpOnly"] = True
-            if cookie.get("sameSite"):
-                cookie_obj["sameSite"] = cookie["sameSite"]
-
-            cookies.append(cookie_obj)
+        cookies = prepare_cookies(cookies_data)
+        if not cookies:
+            raise ValueError("Cookies JSON did not contain any usable cookies")
 
         # Type cast to satisfy mypy - cookie_obj matches SetCookieParam structure
         await context.add_cookies(cookies)  # type: ignore[arg-type]
-        logger.info("Injected %d cookies into browser context (stripped expiration)", len(cookies))
+        cookie_summary = ", ".join(f"{c['name']}@{c['domain']}" for c in cookies)
+        logger.info(
+            "Injected %d cookies into browser context (stripped expiration, mirrored x.com/twitter.com): %s",
+            len(cookies),
+            cookie_summary,
+        )
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON in cookies: {e}") from e
     except ValueError:

@@ -28,6 +28,15 @@ logger = logging.getLogger(__name__)
 class BrowserTwitterClient(TwitterClient):
     """Browser-based Twitter client using Playwright"""
 
+    _LOGGED_IN_SELECTORS = [
+        '[data-testid="primaryColumn"]',
+        '[data-testid="AppTabBar_Home_Link"]',
+        '[data-testid="AppTabBar_Profile_Link"]',
+        '[data-testid="SideNav_AccountSwitcher_Button"]',
+        '[data-testid="AppTabBar_Notifications_Link"]',
+        'a[href="/home"]',
+    ]
+
     def __init__(
         self,
         cookies_json: Optional[str] = None,
@@ -87,7 +96,10 @@ class BrowserTwitterClient(TwitterClient):
             "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
+                "--no-first-run",
+                "--no-default-browser-check",
             ],
+            "ignore_default_args": ["--enable-automation"],
         }
         # Match debug script's slow_mo when headed to make behavior consistent
         if not self.headless:
@@ -95,10 +107,12 @@ class BrowserTwitterClient(TwitterClient):
 
         self.browser = await self.playwright.chromium.launch(**launch_kwargs)  # type: ignore[arg-type]
 
-        # Create context with stealth measures
+        # Use Playwright's default UA so it matches the bundled Chromium version.
+        # A stale hardcoded UA (e.g. Chrome/120) is a strong bot signal on X.
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="en-US",
+            color_scheme="light",
         )
 
         await stealth.apply_stealth_measures(self.context)
@@ -117,57 +131,7 @@ class BrowserTwitterClient(TwitterClient):
             logger.info("Attempting cookie authentication")
             try:
                 await auth.inject_cookies(self.context, self.cookies_json)
-                # Navigate to verify authentication
-                # Use x.com (Twitter rebranded) with domcontentloaded for faster, more reliable loading
-                try:
-                    await self.page.goto("https://x.com/home",
-                                        wait_until="domcontentloaded",
-                                        timeout=60000)  # 60 second timeout
-                except Exception as e:
-                    logger.warning("Initial navigation timeout/error: %s, continuing anyway", e)
-
-                # Log current URL after navigation
-                current_url = self.page.url
-                logger.debug("After cookie auth navigation, current URL: %s", current_url)
-
-                # Wait for page to settle (matching debug script's 5 second wait)
-                await asyncio.sleep(5)
-
-                # Dismiss any popups that appeared after initial navigation
-                await self._dismiss_popups()
-
-                # Check if we're actually logged in (not redirected to login page)
-                # If we're on a login page, cookie auth failed
-                is_logged_in = True
-                if "/i/flow/login" in current_url or "/login" in current_url:
-                    logger.warning("Cookie authentication failed - redirected to login page")
-                    is_logged_in = False
-                else:
-                    # Double check by looking for logged-in elements
-                    try:
-                        # Home link in sidebar is a very reliable indicator of being logged in
-                        home_link = self.page.locator('[data-testid="AppTabBar_Home_Link"]').first
-                        primary_col = self.page.locator('[data-testid="primaryColumn"]').first
-
-                        if await home_link.count() > 0 or await primary_col.count() > 0:
-                            logger.info("Cookie authentication appears successful (logged-in elements found)")
-                        else:
-                            # If we don't see logged-in elements, we might be on a "Sign in" splash page
-                            # even if the URL doesn't contain /login
-                            logger.warning("Could not find logged-in elements after cookie injection")
-
-                            # Save debug screenshot
-
-                            debug_dir = Path("debug_output")
-                            debug_dir.mkdir(exist_ok=True)
-                            await self.page.screenshot(path=str(debug_dir / "auth_check_failed.png"))
-                            logger.info("Saved auth failure screenshot to %s/auth_check_failed.png", debug_dir)
-
-                            is_logged_in = False
-                    except Exception as e:
-                        logger.warning("Error during auth element check: %s", e)
-                        # If check fails, we'll assume it might be okay or fall back
-
+                is_logged_in = await self._authenticate_with_cookies()
                 if not is_logged_in:
                     cookie_auth_failed = True
                 else:
@@ -197,6 +161,96 @@ class BrowserTwitterClient(TwitterClient):
 
         self._initialized = True
         logger.info("Browser client initialized successfully")
+
+    def _page_url(self) -> str:
+        assert self.page is not None
+        return str(self.page.url or "")
+
+    def _url_looks_like_login(self, url: str) -> bool:
+        lowered = url.lower()
+        return (
+            "/i/flow/login" in lowered
+            or "/i/flow/signup" in lowered
+            or lowered.rstrip("/").endswith("/login")
+            or "/login?" in lowered
+        )
+
+    async def _goto_home(self) -> None:
+        assert self.page is not None
+        try:
+            await self.page.goto(
+                "https://x.com/home",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+        except Exception as e:
+            logger.warning("Home navigation timeout/error: %s, continuing anyway", e)
+
+    async def _verify_logged_in(self, timeout_ms: int = 20000) -> bool:
+        """Return True if the X web app looks authenticated."""
+        assert self.page is not None
+        combined = ", ".join(self._LOGGED_IN_SELECTORS)
+        try:
+            await self.page.wait_for_selector(combined, timeout=timeout_ms, state="attached")
+            logger.info(
+                "Cookie authentication appears successful (logged-in elements found) URL=%s",
+                self._page_url(),
+            )
+            return True
+        except Exception as e:
+            logger.warning("Could not find logged-in elements after cookie injection: %s", e)
+
+        current_url = self._page_url()
+        logger.warning("Auth check URL after wait: %s", current_url)
+        if self._url_looks_like_login(current_url):
+            logger.warning("Cookie authentication failed - redirected to login page")
+            return False
+
+        try:
+            title = await self.page.title()
+            body_text = (await self.page.inner_text("body"))[:500].replace("\n", " ")
+            logger.warning("Auth check page title=%r body_preview=%r", title, body_text)
+        except Exception as diag_error:
+            logger.debug("Failed to collect auth page diagnostics: %s", diag_error)
+        return False
+
+    async def _save_auth_failure_debug(self) -> None:
+        assert self.page is not None
+        debug_dir = Path("debug_output")
+        debug_dir.mkdir(exist_ok=True)
+        screenshot = debug_dir / "auth_check_failed.png"
+        html_path = debug_dir / "auth_check_failed.html"
+        try:
+            await self.page.screenshot(path=str(screenshot), full_page=True)
+            html_path.write_text(await self.page.content(), encoding="utf-8")
+            logger.info("Saved auth failure screenshot to %s and HTML to %s", screenshot, html_path)
+        except Exception as e:
+            logger.warning("Failed to save auth debug artifacts: %s", e)
+
+    async def _authenticate_with_cookies(self) -> bool:
+        """Navigate to home and confirm cookie auth, retrying once on failure."""
+        assert self.page is not None
+        await self._goto_home()
+        await asyncio.sleep(1)
+        await self._dismiss_popups()
+
+        if await self._verify_logged_in():
+            return True
+
+        logger.warning("Auth check failed, retrying home navigation once")
+        try:
+            await self.page.reload(wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            logger.warning("Reload after failed auth check errored: %s", e)
+            await self._goto_home()
+        await asyncio.sleep(2)
+        await self._dismiss_popups()
+
+        if await self._verify_logged_in():
+            return True
+
+        await self._save_auth_failure_debug()
+        return False
 
     async def _setup_response_interception(self) -> None:
         """Set up response interception for Twitter GraphQL endpoints"""

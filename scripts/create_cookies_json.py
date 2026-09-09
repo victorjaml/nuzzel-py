@@ -14,7 +14,32 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _is_truthy_flag(value: str) -> bool:
+    lowered = value.strip().lower()
+    return "✓" in value or "✔" in value or lowered in ("true", "yes", "checked")
+
+
+def _parse_cookie_flags(columns: List[str]) -> Tuple[bool, bool, Optional[str]]:
+    """Parse HttpOnly, Secure, and SameSite from DevTools columns after Path/Expires.
+
+    Chrome copies Size (numeric) before the flags. Older copies may omit Size.
+    Empty flag cells mean false, not "missing column".
+    """
+    cols = [col.strip() for col in columns]
+    if cols and cols[0].isdigit():
+        cols = cols[1:]
+
+    http_only = _is_truthy_flag(cols[0]) if len(cols) >= 1 else False
+    secure = _is_truthy_flag(cols[1]) if len(cols) >= 2 else False
+    same_site = None
+    if len(cols) >= 3 and cols[2]:
+        lowered = cols[2].lower()
+        if lowered in ("lax", "strict", "none"):
+            same_site = "None" if lowered == "none" else cols[2].capitalize()
+    return http_only, secure, same_site
 
 
 def parse_cookies_from_text(text: str) -> List[Dict[str, Any]]:
@@ -70,22 +95,8 @@ def parse_cookies_from_text(text: str) -> List[Dict[str, Any]]:
             except (ValueError, AttributeError):
                 pass
 
-        # Check HttpOnly flag (usually column 6, index 5)
-        http_only = False
-        if len(parts) > 5:
-            http_only = '✓' in parts[5] or 'true' in parts[5].lower()
-
-        # Check Secure flag (usually column 7, index 6)
-        secure = False
-        if len(parts) > 6:
-            secure = '✓' in parts[6] or 'true' in parts[6].lower()
-
-        # Parse SameSite (usually column 8, index 7)
-        same_site = None
-        if len(parts) > 7 and parts[7].strip():
-            same_site_val = parts[7].strip()
-            if same_site_val.lower() in ('lax', 'strict', 'none'):
-                same_site = same_site_val.capitalize()
+        # Chrome DevTools columns after Path/Expires: Size, HttpOnly, Secure, SameSite, ...
+        http_only, secure, same_site = _parse_cookie_flags(parts[5:])
 
         cookie: Dict[str, Any] = {
             "name": name,
@@ -151,9 +162,9 @@ def main():
         project_root = Path(__file__).parent.parent
         cookies_file = project_root / "cookies.json"
 
-        # Write cookies to file
+        # Write cookies as one line so the file can be pasted into GitHub secrets
         with open(cookies_file, 'w', encoding='utf-8') as f:
-            json.dump(cookies, f)
+            json.dump(cookies, f, separators=(',', ':'))
 
         print(f"\n✓ Successfully created cookies.json with {len(cookies)} cookies")
         print(f"  Location: {cookies_file}")
@@ -161,6 +172,11 @@ def main():
         print("Cookies created:")
         for cookie in cookies:
             print(f"  - {cookie['name']} ({cookie['domain']})")
+        print()
+        print("IMPORTANT: GitHub Actions does not read cookies.json.")
+        print("Copy the file contents into the TWITTER_SESSION_COOKIES")
+        print("repository secret (Settings → Secrets → Actions).")
+        print("Do not wrap the JSON in extra quotes.")
 
     except Exception as e:
         print(f"\nError: {e}")

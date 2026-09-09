@@ -448,7 +448,7 @@ def create_twitter_client() -> TwitterClient:
             if not cookies_json:
                 cookies_json = None
                 logger.warning(
-                    "TWITTER_SESSION_COOKIES is empty. Falling back to username and password environment variables."
+                    "TWITTER_SESSION_COOKIES is empty. Falling back to cookies.json or username/password."
                 )
             else:
                 # Validate that cookies_json is valid JSON
@@ -456,7 +456,21 @@ def create_twitter_client() -> TwitterClient:
                     json.loads(cookies_json)
                 except json.JSONDecodeError as e:
                     cookies_json = None
-                    logger.warning("TWITTER_SESSION_COOKIES contains invalid JSON: %s. Falling back to username and password environment variables.", e)
+                    logger.warning(
+                        "TWITTER_SESSION_COOKIES contains invalid JSON: %s. Falling back to cookies.json or username/password.",
+                        e,
+                    )
+
+        if not cookies_json:
+            cookies_path = Path("cookies.json")
+            if cookies_path.is_file() and cookies_path.stat().st_size > 0:
+                try:
+                    cookies_json = cookies_path.read_text(encoding="utf-8").strip()
+                    json.loads(cookies_json)
+                    logger.info("Loaded cookies from cookies.json")
+                except json.JSONDecodeError as e:
+                    cookies_json = None
+                    logger.warning("cookies.json contains invalid JSON: %s", e)
 
         username = os.getenv("TWITTER_USERNAME")
         password = os.getenv("TWITTER_PASSWORD")
