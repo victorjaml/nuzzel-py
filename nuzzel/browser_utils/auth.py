@@ -17,6 +17,15 @@ _SAMESITE_MAP = {
     "none": "None",
     "no_restriction": "None",
 }
+# Cloudflare bot cookies are bound to IP + UA. Replaying a laptop's __cf_bm
+# from GitHub Actions makes the challenge harder, not easier.
+_CLOUDFLARE_COOKIE_PREFIXES = ("__cf", "cf_")
+_CLOUDFLARE_COOKIE_NAMES = {"_cfuvid"}
+
+
+def _is_cloudflare_cookie(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in _CLOUDFLARE_COOKIE_NAMES or lowered.startswith(_CLOUDFLARE_COOKIE_PREFIXES)
 
 
 def _normalize_samesite(value: Any) -> Optional[str]:
@@ -53,6 +62,9 @@ def prepare_cookies(cookies_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         name = cookie.get("name")
         value = cookie.get("value")
         if not name or value is None:
+            continue
+        if _is_cloudflare_cookie(name):
+            logger.info("Skipping Cloudflare cookie %s (IP-bound; will be issued fresh)", name)
             continue
 
         names.append(name)

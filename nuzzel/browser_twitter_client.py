@@ -36,6 +36,13 @@ class BrowserTwitterClient(TwitterClient):
         '[data-testid="AppTabBar_Notifications_Link"]',
         'a[href="/home"]',
     ]
+    _CLOUDFLARE_TITLE = "just a moment"
+    _CLOUDFLARE_BODY_MARKERS = (
+        "performing security verification",
+        "verify you are not a bot",
+        "checking your browser",
+        "cf-browser-verification",
+    )
 
     def __init__(
         self,
@@ -77,6 +84,7 @@ class BrowserTwitterClient(TwitterClient):
         # Data collection
         self._captured_responses: List[Dict[str, Any]] = []
         self._user_id: Optional[str] = None
+        self._last_auth_error: Optional[str] = None
 
         # Initialize browser (lazy initialization)
         self._initialized = False
@@ -105,7 +113,8 @@ class BrowserTwitterClient(TwitterClient):
         if not self.headless:
             launch_kwargs["slow_mo"] = 500
 
-        self.browser = await self.playwright.chromium.launch(**launch_kwargs)  # type: ignore[arg-type]
+        self.browser = await self._launch_browser(launch_kwargs)
+        self._last_auth_error = None
 
         # Use Playwright's default UA so it matches the bundled Chromium version.
         # A stale hardcoded UA (e.g. Chrome/120) is a strong bot signal on X.
@@ -149,7 +158,8 @@ class BrowserTwitterClient(TwitterClient):
                 )
             elif cookie_auth_failed:
                 raise ValueError(
-                    "Cookie authentication failed and no username/password provided for fallback"
+                    self._last_auth_error
+                    or "Cookie authentication failed and no username/password provided for fallback"
                 )
         elif not self.cookies_json and not (self.username and self.password):
             raise ValueError(
@@ -161,6 +171,20 @@ class BrowserTwitterClient(TwitterClient):
 
         self._initialized = True
         logger.info("Browser client initialized successfully")
+
+    async def _launch_browser(self, launch_kwargs: Dict[str, Any]) -> Browser:
+        """Prefer system Chrome when present; GitHub runners already install it."""
+        assert self.playwright is not None
+        try:
+            browser = await self.playwright.chromium.launch(
+                channel="chrome",
+                **launch_kwargs,  # type: ignore[arg-type]
+            )
+            logger.info("Launched system Chrome")
+            return browser
+        except Exception as e:
+            logger.info("System Chrome unavailable (%s); using bundled Chromium", e)
+            return await self.playwright.chromium.launch(**launch_kwargs)  # type: ignore[arg-type]
 
     def _page_url(self) -> str:
         assert self.page is not None
@@ -186,6 +210,45 @@ class BrowserTwitterClient(TwitterClient):
         except Exception as e:
             logger.warning("Home navigation timeout/error: %s, continuing anyway", e)
 
+    async def _page_title(self) -> str:
+        assert self.page is not None
+        try:
+            return str(await self.page.title() or "")
+        except Exception:
+            return ""
+
+    async def _page_body_preview(self, limit: int = 500) -> str:
+        assert self.page is not None
+        try:
+            return str(await self.page.inner_text("body") or "").replace("\n", " ")[:limit]
+        except Exception:
+            return ""
+
+    async def _cloudflare_challenge_visible(self) -> bool:
+        title = (await self._page_title()).lower()
+        if self._CLOUDFLARE_TITLE in title:
+            return True
+        body = (await self._page_body_preview(800)).lower()
+        return any(marker in body for marker in self._CLOUDFLARE_BODY_MARKERS)
+
+    async def _wait_out_cloudflare(self, timeout_ms: int = 45000) -> bool:
+        """Wait for Cloudflare's JS check to finish. Returns False if it stays up."""
+        if not await self._cloudflare_challenge_visible():
+            return True
+
+        logger.warning(
+            "Cloudflare bot check detected; waiting up to %.0fs for it to pass",
+            timeout_ms / 1000,
+        )
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(2)
+            if not await self._cloudflare_challenge_visible():
+                logger.info("Cloudflare bot check passed")
+                return True
+        logger.warning("Cloudflare bot check did not clear")
+        return False
+
     async def _verify_logged_in(self, timeout_ms: int = 20000) -> bool:
         """Return True if the X web app looks authenticated."""
         assert self.page is not None
@@ -207,8 +270,8 @@ class BrowserTwitterClient(TwitterClient):
             return False
 
         try:
-            title = await self.page.title()
-            body_text = (await self.page.inner_text("body"))[:500].replace("\n", " ")
+            title = await self._page_title()
+            body_text = await self._page_body_preview()
             logger.warning("Auth check page title=%r body_preview=%r", title, body_text)
         except Exception as diag_error:
             logger.debug("Failed to collect auth page diagnostics: %s", diag_error)
@@ -231,11 +294,22 @@ class BrowserTwitterClient(TwitterClient):
         """Navigate to home and confirm cookie auth, retrying once on failure."""
         assert self.page is not None
         await self._goto_home()
-        await asyncio.sleep(1)
+        cloudflare_cleared = await self._wait_out_cloudflare()
         await self._dismiss_popups()
 
-        if await self._verify_logged_in():
+        if cloudflare_cleared and await self._verify_logged_in():
             return True
+
+        if not cloudflare_cleared or await self._cloudflare_challenge_visible():
+            self._last_auth_error = (
+                "X showed a Cloudflare bot check (Just a moment...) before the app loaded. "
+                "Session cookies were injected successfully; this environment is being treated "
+                "as a bot (common on GitHub-hosted runners). Retry the workflow, run the digest "
+                "locally, or use a self-hosted runner."
+            )
+            logger.warning(self._last_auth_error)
+            await self._save_auth_failure_debug()
+            return False
 
         logger.warning("Auth check failed, retrying home navigation once")
         try:
@@ -243,11 +317,21 @@ class BrowserTwitterClient(TwitterClient):
         except Exception as e:
             logger.warning("Reload after failed auth check errored: %s", e)
             await self._goto_home()
+        await self._wait_out_cloudflare()
         await asyncio.sleep(2)
         await self._dismiss_popups()
 
         if await self._verify_logged_in():
             return True
+
+        if await self._cloudflare_challenge_visible():
+            self._last_auth_error = (
+                "X showed a Cloudflare bot check (Just a moment...) before the app loaded. "
+                "Session cookies were injected successfully; this environment is being treated "
+                "as a bot (common on GitHub-hosted runners). Retry the workflow, run the digest "
+                "locally, or use a self-hosted runner."
+            )
+            logger.warning(self._last_auth_error)
 
         await self._save_auth_failure_debug()
         return False

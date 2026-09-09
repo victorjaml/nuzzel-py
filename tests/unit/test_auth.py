@@ -58,6 +58,23 @@ def test_prepare_cookies_leaves_other_domains_alone():
     assert cookies[0]["domain"] == ".ads-twitter.com"
 
 
+def test_prepare_cookies_skips_cloudflare_bot_cookies():
+    cookies = prepare_cookies(
+        [
+            {"name": "auth_token", "value": "secret", "domain": ".x.com", "path": "/"},
+            {"name": "__cf_bm", "value": "bot-mgmt", "domain": ".x.com", "path": "/"},
+            {"name": "cf_clearance", "value": "cleared", "domain": ".x.com", "path": "/"},
+            {"name": "_cfuvid", "value": "vid", "domain": ".x.com", "path": "/"},
+        ]
+    )
+
+    names = {cookie["name"] for cookie in cookies}
+    assert "auth_token" in names
+    assert "__cf_bm" not in names
+    assert "cf_clearance" not in names
+    assert "_cfuvid" not in names
+
+
 def test_prepare_cookies_dedupes_existing_both_domains():
     cookies = prepare_cookies(
         [
