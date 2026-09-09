@@ -552,6 +552,10 @@ class BrowserTwitterClient(TwitterClient):
                 # Generic close icons
                 'svg[aria-label*="Close"]',
                 'svg[aria-label*="close"]',
+                # Acknowledgement / ToS buttons (X currently shows "Got it")
+                'button:has-text("Got it")',
+                'button:has-text("I understand")',
+                'button:has-text("Accept")',
                 # "Not now" or "Skip" buttons
                 'button:has-text("Not now")',
                 'button:has-text("Skip")',
@@ -562,27 +566,30 @@ class BrowserTwitterClient(TwitterClient):
 
             popup_dismissed = False
 
-            # Try to find and click close buttons
-            for selector in close_selectors:
-                try:
-                    close_btn = self.page.locator(selector).first
-                    if await close_btn.count() > 0 and await close_btn.is_visible():
-                        # Check if it's in a modal/popup context (not just any close button)
-                        # Look for modal/popup containers
-                        has_modal_parent = await close_btn.evaluate("""el => {
-                            const parent = el.closest('[role=\"dialog\"], [role=\"alertdialog\"], [data-testid*=\"modal\"], [data-testid*=\"popup\"], [class*=\"modal\"], [class*=\"overlay\"]');
-                            return parent !== null;
-                        }""")
+            # X sometimes stacks ToS / upsell dialogs; try a few times.
+            for _ in range(3):
+                dismissed_this_round = False
+                for selector in close_selectors:
+                    try:
+                        close_btn = self.page.locator(selector).first
+                        if await close_btn.count() > 0 and await close_btn.is_visible():
+                            has_modal_parent = await close_btn.evaluate("""el => {
+                                const parent = el.closest('[role=\"dialog\"], [role=\"alertdialog\"], [data-testid*=\"modal\"], [data-testid*=\"popup\"], [class*=\"modal\"], [class*=\"overlay\"]');
+                                return parent !== null;
+                            }""")
 
-                        if has_modal_parent:
-                            logger.info("Dismissing popup using selector: %s", selector)
-                            await close_btn.click()
-                            await self._random_delay(0.5, 1.0)
-                            popup_dismissed = True
-                            break
-                except Exception as e:
-                    logger.debug("Close selector %s failed: %s", selector, e)
-                    continue
+                            if has_modal_parent:
+                                logger.info("Dismissing popup using selector: %s", selector)
+                                await close_btn.click()
+                                await self._random_delay(0.5, 1.0)
+                                dismissed_this_round = True
+                                popup_dismissed = True
+                                break
+                    except Exception as e:
+                        logger.debug("Close selector %s failed: %s", selector, e)
+                        continue
+                if not dismissed_this_round:
+                    break
 
             # If no close button found, try pressing Escape key
             if not popup_dismissed:
@@ -610,6 +617,60 @@ class BrowserTwitterClient(TwitterClient):
             logger.debug("Error dismissing popups: %s", e)
             # Don't fail the whole operation if popup dismissal fails
 
+    async def _wait_for_dialogs_to_clear(self, timeout_ms: int = 5000) -> None:
+        """Wait until X dialogs are gone so tabs behind them can be clicked."""
+        assert self.page is not None
+        try:
+            await self.page.locator('[role="dialog"], [role="alertdialog"]').first.wait_for(
+                state="hidden",
+                timeout=timeout_ms,
+            )
+        except Exception:
+            logger.debug("Dialog still present or none found after wait")
+
+    async def _logged_in_screen_name(self) -> Optional[str]:
+        """Read the handle from the logged-in sidebar, not TWITTER_USERNAME.
+
+        Profile/likes URLs break if the env var is an old handle.
+        """
+        assert self.page is not None
+        selectors = [
+            '[data-testid="AppTabBar_Profile_Link"]',
+            'nav a[aria-label="Profile"]',
+            'a[data-testid="AppTabBar_Profile_Link"]',
+        ]
+        for selector in selectors:
+            try:
+                link = self.page.locator(selector).first
+                if await link.count() == 0:
+                    continue
+                href = await link.get_attribute("href")
+                if not href:
+                    continue
+                handle = href.strip("/").split("/")[0].lstrip("@")
+                if handle and handle.lower() not in {"home", "explore", "i", "settings", "notifications"}:
+                    logger.info("Resolved logged-in handle from %s: @%s", selector, handle)
+                    return handle
+            except Exception as e:
+                logger.debug("Could not read handle from %s: %s", selector, e)
+        return None
+
+    async def _profile_url_handle(self) -> str:
+        """Handle used to build profile and likes URLs."""
+        session_handle = await self._logged_in_screen_name()
+        env_handle = (self.username or "").lstrip("@")
+        if session_handle:
+            if env_handle and env_handle.lower() != session_handle.lower():
+                logger.warning(
+                    "TWITTER_USERNAME=%s does not match logged-in @%s; using the session handle",
+                    env_handle,
+                    session_handle,
+                )
+            return session_handle
+        if env_handle:
+            return env_handle
+        return str(await self.get_user_id())
+
     async def _switch_to_following_tab(self) -> bool:
         """Switch to the 'Following' tab on the home timeline.
 
@@ -621,6 +682,9 @@ class BrowserTwitterClient(TwitterClient):
         """
         assert self.page is not None
         try:
+            await self._dismiss_popups()
+            await self._wait_for_dialogs_to_clear()
+
             # Wait for page to fully load
             await self._random_delay(1, 2)
 
@@ -658,8 +722,8 @@ class BrowserTwitterClient(TwitterClient):
                             logger.info("Already on Following tab")
                             return True
 
-                        # Click the tab
-                        await element.click()
+                        # Click the tab (timeout so a leftover overlay fails fast)
+                        await element.click(timeout=5000)
                         await asyncio.sleep(2)  # Match debug script timing
                         logger.info("Switched to Following tab using selector: %s", selector)
                         return True
@@ -934,9 +998,7 @@ class BrowserTwitterClient(TwitterClient):
         # Clear previous captures BEFORE navigation to catch initial load responses
         self._captured_responses.clear()
 
-        # Use username for URL if available, otherwise numeric ID
-        handle = self.username or await self.get_user_id()
-        # Ensure handle doesn't have @ prefix for URL
+        handle = await self._profile_url_handle()
         url_handle = handle.lstrip('@')
 
         likes_url = f"https://x.com/{url_handle}/likes"
@@ -973,6 +1035,7 @@ class BrowserTwitterClient(TwitterClient):
                 "Something went wrong",
                 "Try again",
                 "This page doesn't exist",
+                "This account doesn't exist",
                 "You don't have any likes yet",
                 "These likes are private",
                 "Sign in",
@@ -1082,9 +1145,7 @@ class BrowserTwitterClient(TwitterClient):
         # Clear previous captures BEFORE navigation to catch initial load responses
         self._captured_responses.clear()
 
-        # Use username for URL if available, otherwise numeric ID
-        handle = self.username or await self.get_user_id()
-        # Ensure handle doesn't have @ prefix for URL
+        handle = await self._profile_url_handle()
         url_handle = handle.lstrip('@')
 
         user_url = f"https://x.com/{url_handle}"
@@ -1232,12 +1293,8 @@ class BrowserTwitterClient(TwitterClient):
         # Clear previous captures BEFORE navigation
         self._captured_responses.clear()
 
-        # Use username for URL if available, otherwise fallback to generic lists URL
-        if self.username:
-            url_handle = self.username.lstrip('@')
-            lists_url = f"https://x.com/{url_handle}/lists"
-        else:
-            lists_url = "https://x.com/i/lists"
+        url_handle = await self._profile_url_handle()
+        lists_url = f"https://x.com/{url_handle}/lists"
 
         await self.page.goto(lists_url,
                             wait_until="domcontentloaded",

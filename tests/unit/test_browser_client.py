@@ -323,3 +323,32 @@ class TestBrowserTwitterClient:
             mock_browser.close.assert_called_once()
             mock_playwright_instance.stop.assert_called_once()
             assert client._initialized is False
+
+    @pytest.mark.asyncio
+    async def test_profile_url_handle_prefers_session_over_stale_username(self):
+        """Likes/profile URLs should use the logged-in handle, not TWITTER_USERNAME."""
+        client = BrowserTwitterClient(username="_oldhandle", cookies_json="[]")
+        profile_link = AsyncMock()
+        profile_link.count = AsyncMock(return_value=1)
+        profile_link.get_attribute = AsyncMock(return_value="/currenthandle")
+
+        locator = MagicMock()
+        locator.first = profile_link
+        client.page = MagicMock()
+        client.page.locator = MagicMock(return_value=locator)
+
+        handle = await client._profile_url_handle()
+        assert handle == "currenthandle"
+
+    @pytest.mark.asyncio
+    async def test_profile_url_handle_falls_back_to_username(self):
+        client = BrowserTwitterClient(username="@envuser", cookies_json="[]")
+        missing_link = AsyncMock()
+        missing_link.count = AsyncMock(return_value=0)
+        locator = MagicMock()
+        locator.first = missing_link
+        client.page = MagicMock()
+        client.page.locator = MagicMock(return_value=locator)
+
+        handle = await client._profile_url_handle()
+        assert handle == "envuser"
