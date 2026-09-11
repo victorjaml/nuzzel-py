@@ -109,15 +109,19 @@ class BrowserTwitterClient(TwitterClient):
             ],
             "ignore_default_args": ["--enable-automation"],
         }
-        # Match debug script's slow_mo when headed to make behavior consistent
-        if not self.headless:
-            launch_kwargs["slow_mo"] = 500
+        # Match debug script's slow_mo when headed to make behavior consistent.
+        # CI runs headed under Xvfb and sets BROWSER_SLOW_MO_MS=0 so scrolling isn't throttled.
+        slow_mo_ms = int(os.getenv("BROWSER_SLOW_MO_MS", "0" if self.headless else "500"))
+        if slow_mo_ms > 0:
+            launch_kwargs["slow_mo"] = slow_mo_ms
 
         self.browser = await self._launch_browser(launch_kwargs)
         self._last_auth_error = None
 
-        # Use Playwright's default UA so it matches the bundled Chromium version.
+        # Use the browser's own UA so it matches the real Chrome version.
         # A stale hardcoded UA (e.g. Chrome/120) is a strong bot signal on X.
+        # Headless Chrome still sends "HeadlessChrome" in the User-Agent and sec-ch-ua
+        # headers, which Cloudflare blocks; that's why CI runs headed under Xvfb.
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
@@ -301,13 +305,7 @@ class BrowserTwitterClient(TwitterClient):
             return True
 
         if not cloudflare_cleared or await self._cloudflare_challenge_visible():
-            self._last_auth_error = (
-                "X showed a Cloudflare bot check (Just a moment...) before the app loaded. "
-                "Session cookies were injected successfully; this environment is being treated "
-                "as a bot (common on GitHub-hosted runners). Retry the workflow, run the digest "
-                "locally, or use a self-hosted runner."
-            )
-            logger.warning(self._last_auth_error)
+            self._record_cloudflare_block()
             await self._save_auth_failure_debug()
             return False
 
@@ -325,16 +323,27 @@ class BrowserTwitterClient(TwitterClient):
             return True
 
         if await self._cloudflare_challenge_visible():
-            self._last_auth_error = (
-                "X showed a Cloudflare bot check (Just a moment...) before the app loaded. "
-                "Session cookies were injected successfully; this environment is being treated "
-                "as a bot (common on GitHub-hosted runners). Retry the workflow, run the digest "
-                "locally, or use a self-hosted runner."
-            )
-            logger.warning(self._last_auth_error)
+            self._record_cloudflare_block()
 
         await self._save_auth_failure_debug()
         return False
+
+    def _record_cloudflare_block(self) -> None:
+        if self.headless:
+            hint = (
+                "Headless Chrome identifies itself as HeadlessChrome, which Cloudflare blocks; "
+                "set BROWSER_HEADLESS=false (on Linux CI, run under xvfb-run)."
+            )
+        else:
+            hint = (
+                "This environment is being treated as a bot (common on GitHub-hosted runners). "
+                "Retry the workflow, run the digest locally, or use a self-hosted runner."
+            )
+        self._last_auth_error = (
+            "X showed a Cloudflare bot check (Just a moment...) before the app loaded. "
+            f"Session cookies were injected successfully. {hint}"
+        )
+        logger.warning(self._last_auth_error)
 
     async def _setup_response_interception(self) -> None:
         """Set up response interception for Twitter GraphQL endpoints"""

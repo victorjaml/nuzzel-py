@@ -130,6 +130,8 @@ SENDER_EMAIL=noreply@yourdomain.com
 # Optional: For debugging
 # Run in visual mode
 # BROWSER_HEADLESS=false
+# Delay between browser actions in ms (defaults to 500 in visual mode, 0 when headless)
+# BROWSER_SLOW_MO_MS=0
 # Set to true for testing with mock data
 # USE_MOCK=false
 ```

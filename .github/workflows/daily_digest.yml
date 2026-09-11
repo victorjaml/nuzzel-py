@@ -55,7 +55,13 @@ jobs:
           TWITTER_API_SECRET: ${{ secrets.TWITTER_API_SECRET }}
           TWITTER_ACCESS_TOKEN: ${{ secrets.TWITTER_ACCESS_TOKEN }}
           TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
-        run: python -m nuzzel.main
+          # Headless Chrome sends "HeadlessChrome" in its User-Agent/sec-ch-ua headers and X's
+          # Cloudflare check blocks it ("Just a moment..."). Run headed Chrome on a virtual
+          # display instead; xvfb is installed by `playwright install --with-deps`.
+          BROWSER_HEADLESS: 'false'
+          BROWSER_SLOW_MO_MS: '0'
+        # Screen must be at least the 1920x1080 viewport; xvfb-run defaults to 640x480x8.
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -m nuzzel.main
 
       - name: Upload debug screenshots
         if: always()  # Upload artifacts even if previous step failed
